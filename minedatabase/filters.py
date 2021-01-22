@@ -14,7 +14,7 @@ from functools import partial
 
 import numpy as np
 import pandas as pd
-from rdkit.Chem import AllChem, CanonSmiles
+from rdkit.Chem import AllChem, CanonSmiles, RDKFingerprint
 from rdkit.Chem import rdFMCS as mcs
 from rdkit.Chem.Descriptors import ExactMolWt
 from rdkit.Chem.inchi import MolToInchiKey
@@ -236,7 +236,7 @@ class TanimotoSamplingFilter(Filter):
 
         return cpds_remove_set
 
-    def sample_by_tanimoto(self, mol_info, t_fp, n_cpds=None, min_T=0.05,
+    def sample_by_tanimoto_df(self, mol_info, t_fp, n_cpds=None, min_T=0.05,
                            weighting=None, max_iter=None, n_cores=1):
         """
         Given a list of ids and compounds, this function uses inverse-CDF
@@ -309,6 +309,97 @@ class TanimotoSamplingFilter(Filter):
 
         return chosen_ids
 
+    
+    def sample_by_tanimoto(self, mol_info, t_fp, n_cpds=None, min_T=0.05,
+                           weighting=None, max_iter=None, n_cores=1):
+        """
+        Given a list of ids and compounds, this function uses inverse-CDF
+        sampling from a PMF generated from weighted tanimoto similarity
+        to select compounds to expand.
+
+        :param mol_info:  A list consisting of (cpd_id, SMILES)
+        :type mol_info: list(tuple)
+        :param t_fp: A list of the target fingerprints
+        :type t_fp: list(rdkit.DataStructs.cDataStructs.ExplicitBitVect)
+        :param n_cpds: Number of compounds to sample
+        :type n_cpds: int
+        :param min_T: Minimum Tanimoto for consideration
+        :type min_T: float
+        :param weighting: Weighting function that takes Tanimoto as input
+        :type weighting: func
+        :param max_iter: Maximum iterations before new CDF is calculated
+        :type max_iter: int
+        :param n_cores: Number of CPU cores to use
+        :type n_cores: int
+
+        :return: A set of cpd_ids to be expanded
+        :rtype: set(str)
+        """
+
+        # Return input if less than desired number of compounds
+        if len(mol_info) <= n_cpds:
+            ids = set(x[0] for x in mol_info)
+            print("-- Number to sample is less than number of compounds. "
+                  "Returning all compounds.")
+            return ids
+
+        # Get pandas df and ids
+        id_tani = _get_id_tani(mol_info, t_fps=t_fp, n_cores=n_cores)
+
+        if len(id_tani) <= n_cpds:
+            ids = set(df['_id'])
+            print(f"-- After filtering by minimum tanimoto ({min_T}) "
+                  "number to sample is less than number of compounds. "
+                  "Returning all compounds.")
+            return ids
+
+        print("-- Sampling compounds to expand.")
+        then = time.time()
+        # Get discrete distribution to sample randomly from
+        rv, prob = self._gen_rv_from_id_tani(id_tani, weighting=weighting)
+
+        # Sample intervals from rv and get c_id from id
+        if max_iter is None:
+            max_iter = n_cpds / 10 if n_cpds > 1000 else n_cpds / 2
+
+        chosen_ids = set()
+        i = 0
+        nCDF = 0
+
+        while len(chosen_ids) != n_cpds:
+            # if current iteration if greater than max then
+            # recalc distribution to exclude chosen
+            if i > max_iter:
+                i = 0
+                nCDF += 1
+                rv, prob = self._gen_rv_from_id_tani(id_tani, chosen_ids=chosen_ids,
+                                               weighting=weighting)
+
+            chosen_ids.add(prob[rv.rvs(size=1)[0]]["_id"])
+            i += 1
+
+        print(f"-- Finished sampling in {time.time() - then} s."
+              f" Recalculated CDF {nCDF} times.")
+
+        return chosen_ids
+    
+    def _gen_rv_from_id_tani(self, id_tani, weighting=None, chosen_ids=set()):
+        # id_tani ['_id', T]
+        # at this time p is already scaled
+        if not weighting:
+            def weighting(T):
+                return T**4
+
+        prob = [[i[0], weighting(i[1])] for i in id_tani if i[0] not in chosen_ids]
+        tani_sum = sum([i[1] for i in id_tani])
+        prob = {i: {"_id": val[0], "p": val[1]/tani_sum} for i, val in enumerate(id_tani)}
+
+        x = list(prob.keys())
+        y = [v['p'] for v in prob.values()]
+        rv = rv_discrete(values=(x, y))
+
+        return rv, prob
+
     def _gen_rv_from_df(self, df, chosen=[], weighting=None):
         """Genderate a scipy.rv object to sample from."""
         if weighting is None:
@@ -359,6 +450,29 @@ class TanimotoSamplingFilter(Filter):
 
         return df
 
+def _get_id_tani(id_smi, t_fps, n_cores=1):
+        id_tani = []
+        get_max_T_partial = partial(get_max_T, t_fps)
+        # TODO in chunks instead of single
+        pool = multiprocessing.Pool(n_cores)
+        for res in pool.imap_unordered(get_max_T_partial, id_smi):
+            id_tani.append(res)
+
+        return id_tani
+
+def get_max_T(t_fps, id_smi):
+        cpd_fp = RDKFingerprint(MolFromSmiles(id_smi[1]))
+        max_T = FingerprintSimilarity(t_fps[0], cpd_fp)
+
+        if len(t_fps) > 1:
+            for t_fp in t_fps[1:]:
+                max_T = max(max_T, FingerprintSimilarity(t_fp, cpd_fp))                
+                if max_T == 1:
+                    break
+
+        return [id_smi[0], max_T]
+
+
 def _parallelize_dataframe(df, func, n_cores=1):
     """
     Applies a function to a dataframe in parallel by chunking it up over
@@ -397,8 +511,6 @@ def _calc_max_T(t_df, min_T, df):
     df = df[df['T'] > min_T]
 
     return df
-
-    
 
 
 # End Tanimoto Sampling Filter
