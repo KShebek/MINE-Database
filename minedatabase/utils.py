@@ -9,8 +9,50 @@ import re
 
 from rdkit.Chem import AllChem
 
+from collections.abc import Iterator, Iterable
+from itertools import chain, islice
+
 StoichTuple = collections.namedtuple("StoichTuple", 'stoich,c_id')
 
+class Chunks(Iterator):
+    """Limits the number of chunks to yield until yielded values are
+    acknowledged.
+    """
+
+    def __init__(self, it: Iterable, chunk_size: int = 1, return_list: bool = False):
+        self._it = iter(it)
+        self._chunk_size = chunk_size
+        self._return_list = return_list
+
+    def __iter__(self) -> Iterator:
+        return self
+
+    def __next__(self):
+        return self.next()
+
+    def next(self):
+        """Returns the next chunk from the iterable.
+        This method is not thread-safe.
+        :raises TimeoutError: if timeout is given and no value is acknowledged in the mean time.
+        """
+        def peek(iterable):
+            "peek at first element of iterable to determine if it is empty"
+            try:
+                first = next(iterable)
+            except StopIteration:
+                return None
+            return chain([first], iterable)
+
+        next_slice = islice(self._it, self._chunk_size)
+        next_slice = peek(next_slice)
+
+        if next_slice:
+            if self._return_list:
+                return list(next_slice)
+            else:
+                return next_slice
+        else:
+            raise StopIteration
 
 def file_to_dict_list(filepath):
     """Accept a path to a CSV, TSV or JSON file and return a dictionary list"""
@@ -63,7 +105,6 @@ def compound_hash(smi, cpd_type='Predicted'):
         return "C" + chash 
 
 def convert_sets_to_lists(obj):
-    """Recursively converts dictionaries that contain sets to lists"""
     if isinstance(obj, set):
         # This brings short names to the top of the list
         try:

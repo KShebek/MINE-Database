@@ -8,6 +8,7 @@ import platform
 from copy import copy
 from shutil import move
 from subprocess import call
+import multiprocessing
 
 import pymongo
 from pymongo.errors import ServerSelectionTimeoutError
@@ -24,15 +25,16 @@ nps_model = nps.readNPModel()
 def establish_db_client(con_string=None):
     """This establishes a mongo database client in various environments"""
     # If a connection string is given use that, otherwise go to local
-    try:
-        if con_string:
-            client = pymongo.MongoClient(con_string, ServerSelectionTimeoutMS=5)
-        else:
-            client = pymongo.MongoClient(ServerSelectionTimeoutMS=5)
-    except ServerSelectionTimeoutError:
-        raise IOError("Failed to load database client. Please verify that "
-                      "mongod is running")
-    return client  
+    # try:
+    #     if con_string:
+    #         client = pymongo.MongoClient(con_string, ServerSelectionTimeoutMS=5)
+    #     else:
+    #         client = pymongo.MongoClient(ServerSelectionTimeoutMS=5)
+    # except ServerSelectionTimeoutError:
+    #     raise IOError("Failed to load database client. Please verify that "
+    #                   "mongod is running")
+    # return client
+    return None
 
 class MINE:
     """
@@ -40,20 +42,20 @@ class MINE:
     but also defines expected database structure.
     """
     def __init__(self, name, con_string='mongodb://localhost:27017/'):
-        self.client = establish_db_client(con_string)
+        # self.client = establish_db_client(con_string)
         self.con_string = con_string
-        self._db = self.client[name]
-        self._core_db = self.client.core
-        self.core_compounds = self._core_db.compounds
+        # self._db = self.client[name]
+        # self._core = self.client.core
+        # self.core_compounds = self._core.compounds
         self.name = name
-        self.meta_data = self._db.meta_data
-        self.compounds = self._db.compounds
-        self.target_compounds = self._db.target_compounds        
-        self.reactions = self._db.reactions
-        self.operators = self._db.operators
-        self.models = self._db.models
-        self.nps_model = nps.readNPModel()
-        self._mass_cache = {}  # for rapid calculation of reaction mass change
+        # self.meta_data = self._db.meta_data
+        # self.compounds = self._db.compounds
+        # self.target_compounds = self._db.target_compounds        
+        # self.reactions = self._db.reactions
+        # self.operators = self._db.operators
+        # self.models = self._db.models
+        # self.nps_model = nps.readNPModel()
+        # self._mass_cache = {}  # for rapid calculation of reaction mass change
 
     def add_rxn_pointers(self):
         """Add links to the reactions that each compound participates in
@@ -329,7 +331,7 @@ class MINE:
         return None
 
     def insert_mine_compound(self, compound_dict=None, requests=None):
-        """This method saves a RDKit Molecule as a compound entry in the MINE.
+        """This method saves a pickaxe compound as a compound entry in the MINE.
         Calculates necessary fields for API and includes additional
         information passed in the compound dict. Overwrites preexisting
         compounds in MINE on _id collision.
@@ -462,18 +464,18 @@ def insert_mine_compound(compound_dict):
 
         # If the compound is a reactant, then make sure the reactant name is
         # in a correct format.
-        if 'Reactant_in' in compound_dict and isinstance(
-                compound_dict['Reactant_in'], str) \
-                and compound_dict['Reactant_in']:
-            compound_dict['Reactant_in'] = ast.literal_eval(
-                compound_dict['Reactant_in'])
+        # if 'Reactant_in' in compound_dict and isinstance(
+        #         compound_dict['Reactant_in'], str) \
+        #         and compound_dict['Reactant_in']:
+        #     compound_dict['Reactant_in'] = ast.literal_eval(
+        #         compound_dict['Reactant_in'])
         # If the compound is a product, then make sure the reactant name is
         # in a correct format.
-        if 'Product_of' in compound_dict \
-                and isinstance(compound_dict['Product_of'], str) \
-                and compound_dict['Product_of']:
-            compound_dict['Product_of'] = ast.literal_eval(
-                compound_dict['Product_of'])
+        # if 'Product_of' in compound_dict \
+        #         and isinstance(compound_dict['Product_of'], str) \
+        #         and compound_dict['Product_of']:
+        #     compound_dict['Product_of'] = ast.literal_eval(
+        #         compound_dict['Product_of'])
 
         return pymongo.InsertOne(compound_dict)
 
@@ -549,3 +551,74 @@ def insert_reaction(reaction_dict):
     reaction_dict = utils.convert_sets_to_lists(reaction_dict)
 
     return pymongo.InsertOne(reaction_dict)
+
+def save_reactions_to_db(rxns: dict, db, chunk_size: int = 10) -> None:
+    n_rxns = len(rxns)
+    for i, rxn_chunk in enumerate(utils.Chunks(rxns.values(), chunk_size)):
+        if i%20 == 0:
+            print(f"Writing Reactions: Chunk {i} of {int(n_rxns/chunk_size)}")
+        rxn_requests = [pymongo.InsertOne(utils.convert_sets_to_lists(reaction_dict)) for reaction_dict in rxn_chunk]
+        
+        # db.reactions.bulk_write(rxn_requests, ordered=False)
+    
+def save_core_compounds_to_db(cpds: dict, db, mine, chunk_size: int, num_workers: int = 1) -> None:
+    pool = multiprocessing.Pool(num_workers)
+    n_cpds = len(cpds)
+    for i, cpd_chunk in enumerate(utils.Chunks(cpds.values(), chunk_size, True)):
+        if i%20 == 0:
+            print(f"Writing Core Compounds: Chunk {i} of {int(n_cpds/chunk_size)}")
+        cpd_requests = [request for request in pool.imap_unordered(_get_core_cpd_insert, cpd_chunk)]
+        cpd_updates = [_get_core_cpd_update(cpd_dict, mine) for cpd_dict in cpd_chunk]
+        # db.core_compounds.bulk_write(cpd_requests, ordered=False)
+        # db.core_compounds.bulk_write(cpd_updates, ordered=False)    
+    pool.close()
+
+def _get_core_cpd_insert(cpd_dict: dict) -> pymongo.UpdateOne:
+    core_keys = ["_id", "SMILES", "Inchi", "InchiKey", "Mass", "Formula"]
+    core_dict = {key: cpd_dict.get(key) for key in core_keys if cpd_dict.get(key) != None}
+
+    mol_object = AllChem.MolFromSmiles(core_dict['SMILES'])
+                   
+    # Store all different representations of the molecule (SMILES, Formula,
+    #  InChI key, etc.) as well as its properties in a dictionary
+    if not 'SMILES' in core_dict:
+        core_dict['SMILES'] = AllChem.MolToSmiles(mol_object, True)
+    if not 'Inchi' in core_dict:
+        core_dict['Inchi'] = AllChem.MolToInchi(mol_object)
+    if not 'Inchikey' in core_dict:
+        core_dict['Inchikey'] = AllChem.InchiToInchiKey(core_dict['Inchi'])
+
+    core_dict['Mass'] = AllChem.CalcExactMolWt(mol_object)
+    core_dict['Formula'] = AllChem.CalcMolFormula(mol_object)
+    core_dict['logP'] = AllChem.CalcCrippenDescriptors(mol_object)[0]
+    # core_dict['NP_likeness'] = nps.scoreMol(mol_object, nps_model)
+    core_dict['Spectra'] = {}
+    # Record which expansion it's coming from
+    core_dict['MINES'] = []   
+    
+    return pymongo.UpdateOne({'_id': core_dict["_id"]}, {'$setOnInsert': core_dict}, upsert=True)
+
+def _get_core_cpd_update(cpd_dict: dict, MINE: str) -> pymongo.UpdateOne:
+    return pymongo.UpdateOne({'_id': cpd_dict['_id']}, {'$addToSet': {'MINES': MINE}})
+
+def save_compounds_to_db(cpds: dict, db, chunk_size: int = 10000) -> None:
+    n_cpds = len(cpds)
+    for i, cpd_chunk in enumerate(utils.Chunks(cpds.values(), chunk_size)):
+        if i%20 == 0:
+            print(f"Writing Compounds: Chunk {i} of {int(n_cpds/chunk_size)}")
+        to_insert = [_get_cpd_insert(cpd_dict) for cpd_dict in cpd_chunk]
+        # db.compounds.bulk_write([_get_cpd_insert(cpd_dict) for cpd_dict in cpd_chunk])
+    return None
+
+def _get_cpd_insert(cpd_dict: dict) -> pymongo.InsertOne:
+    output_keys = ["_id", "ID", "SMILES", "Type", "Generation", "Reactant_in", "Product_of", "Expand"]
+    return pymongo.InsertOne({key: cpd_dict.get(key) for key in output_keys if cpd_dict.get(key) != None})
+
+def save_targets_to_db(targets: dict, chunk_size: int = 10000) -> None:
+    for i, cpd_chunk in enumerate(utils.Chunks(targets.values(), chunk_size)):
+        to_insert = [_get_target_insert(cpd_dict) for cpd_dict in cpd_chunk]
+
+def _get_target_insert(cpd_dict: dict) -> pymongo.InsertOne:
+    output_keys = ["_id", "SMILES"]
+    return pymongo.InsertOne({key: cpd_dict.get(key) for key in output_keys if cpd_dict.get(key) != None})
+    

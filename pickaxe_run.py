@@ -10,6 +10,7 @@ The general format of a script will be:
 """
 
 import datetime
+import pickle
 import time
 
 import pymongo
@@ -34,9 +35,9 @@ start = time.time()
 write_db = True
 database_overwrite = True
 # database = "APAH_100Sam_50rule"
-database = "Example_Run"
+database = "Example_Path_Large_Test"
 # Message to insert into metadata
-message = ("Example run to show how pickaxe is ran.")
+message = ("Example for pathway analysis")
 
 # mongo DB information
 use_local = True
@@ -50,10 +51,12 @@ write_local = False
 output_dir = '.'
 ###############################################################################
 
+pickle_fname = "debugging.pk"
+pickle_dump = True
 ###############################################################################
 #    Starting Compounds, Cofactors, and Rules
 # Input compounds
-input_cpds = './example_data/starting_cpds_ten.csv'
+input_cpds = '/Users/kevbot/Box Sync/Research/Projects/MINE/MINE-Database/local_data/path_analysis_test/inputs.csv'
 
 # Metacyc Rules
 coreactant_list = './minedatabase/data/metacyc_rules/MetaCyc_Coreactants.tsv'
@@ -62,18 +65,19 @@ coreactant_list = './minedatabase/data/metacyc_rules/MetaCyc_Coreactants.tsv'
 # to generate sets of rules from metacyc based on reaction mapping, where
 # the reactions being mapped are the reactions the rules are derived from.
 rule_list = './minedatabase/data/metacyc_rules/metacyc_90percent_272.tsv'
+# rule_list = './example_data/metacyc_rule_selection/metacyc_57p_30rules_gen_to_intermediate.tsv'
 
 # Partial operators
 # Partial operators allow use of multiple compounds in an any;any expansion
 # Currently uses a significant amount of memory
 partial_rules = False
 mapped_rxns = './minedatabase/data/metacyc_rules/metacyc_mapped.tsv'
-###############################################################################
+###########################################################g112####################
 
 ###############################################################################
 # Core Pickaxe Run Options
-generations = 2
-num_workers = 4     # Number of processes for parallelization
+generations = 1
+num_workers = 12    # Number of processes for parallelization
 verbose = False     # Display RDKit warnings and errors
 explicit_h = False
 kekulize = True
@@ -89,7 +93,7 @@ indexing = False
 # Global Filtering Options
 
 # Path to target cpds file (not required for metabolomics filter)
-target_cpds = './example_data/target_list_single.csv'
+target_cpds = '/Users/kevbot/Box Sync/Research/Projects/MINE/MINE-Database/local_data/path_analysis_test/targets.csv'
 
 # Should targets be flagged for reaction
 react_targets = True
@@ -98,7 +102,7 @@ react_targets = True
 retrosynthesis = False
 
 # Prune results to remove compounds not required to produce targets
-prune_to_targets = True
+prune_to_targets = False
 
 # Filter final generation?
 filter_after_final_gen = True
@@ -122,10 +126,10 @@ increasing_tani = False
 # Samples by tanimoto similarity score, using default RDKit fingerprints
 
 # Apply this sampler?
-tani_sample = False
+tani_sample = True
 
 # Number of compounds per generation to sample
-sample_size = 5
+sample_size = 100000
 
 # weight is a function that specifies weighting of Tanimoto similarity
 # weight accepts one input
@@ -234,51 +238,57 @@ if __name__ == '__main__':  # required for parallelization on Windows
                  quiet=quiet, retro=retrosynthesis, react_targets=react_targets,
                  filter_after_final_gen=filter_after_final_gen)
 
-    # Load compounds
-    pk.load_compound_set(compound_file=input_cpds)
+    if not pickle_fname:
+        # Load compounds
+        pk.load_compound_set(compound_file=input_cpds)
 
-    # Load partial operators
-    if partial_rules:
-        pk.load_partial_operators(mapped_rxns)
+        # Load partial operators
+        if partial_rules:
+            pk.load_partial_operators(mapped_rxns)
 
-    # Load target compounds for filters
-    if (tani_filter or mcs_filter or tani_sample):
-        pk.load_targets(target_cpds, structure_field="SMILES")
+        # Load target compounds for filters
+        if (tani_filter or mcs_filter or tani_sample):
+            pk.load_targets(target_cpds, structure_field="SMILES")
 
-    # Apply filters
-    if tani_filter:
-        taniFilter = TanimotoFilter(filter_name="Tani", crit_tani=tani_threshold,
-                                    increasing_tani=increasing_tani)
-        pk.filters.append(taniFilter)
+        # Apply filters
+        if tani_filter:
+            taniFilter = TanimotoFilter(filter_name="Tani", crit_tani=tani_threshold,
+                                        increasing_tani=increasing_tani)
+            pk.filters.append(taniFilter)
 
-    if tani_sample:
-        taniSampleFilter = TanimotoSamplingFilter(filter_name="Tani_Sample",
-                                                  sample_size=sample_size,
-                                                  weight=weight)
-        pk.filters.append(taniSampleFilter)
+        if tani_sample:
+            taniSampleFilter = TanimotoSamplingFilter(filter_name="Tani_Sample",
+                                                    sample_size=sample_size,
+                                                    weight=weight)
+            pk.filters.append(taniSampleFilter)
 
-    if mcs_filter:
-        mcsFilter = MCSFilter(filter_name="MCS", crit_mcs=crit_mcs)
-        pk.filters.append(mcsFilter)
+        if mcs_filter:
+            mcsFilter = MCSFilter(filter_name="MCS", crit_mcs=crit_mcs)
+            pk.filters.append(mcsFilter)
 
-    if metabolomics_filter:
-        metFilter = MetabolomicsFilter(filter_name="ADP1_Metabolomics_Data",
-                                       met_data_name=met_data_name,
-                                       met_data_path=met_data_path,
-                                       possible_adducts=possible_adducts,
-                                       mass_tolerance=mass_tolerance)
-        pk.filters.append(metFilter)
+        if metabolomics_filter:
+            metFilter = MetabolomicsFilter(filter_name="ADP1_Metabolomics_Data",
+                                        met_data_name=met_data_name,
+                                        met_data_path=met_data_path,
+                                        possible_adducts=possible_adducts,
+                                        mass_tolerance=mass_tolerance)
+            pk.filters.append(metFilter)
 
-    # Transform compounds (the main step)
-    pk.transform_all(num_workers, generations)
+        # Transform compounds (the main step)
+        pk.transform_all(num_workers, generations)
 
-    # Remove cofactor redundancies
-    # Eliminates cofactors that are being counted as compounds
-    pk.remove_cofactor_redundancy()
+        # Remove cofactor redundancies
+        # Eliminates cofactors that are being counted as compounds
+        pk.remove_cofactor_redundancy()
 
-    if (tani_filter or mcs_filter or tani_sample):
-        if prune_to_targets:
-            pk.prune_network_to_targets()
+        if (tani_filter or mcs_filter or tani_sample):
+            if prune_to_targets:
+                pk.prune_network_to_targets()
+
+        if pickle_dump:
+            pk.dump_to_pk('debugging.pk')
+    else:
+        pk.load_pk(pickle_fname)
 
     # Write results to database
     if write_db:
@@ -306,7 +316,7 @@ if __name__ == '__main__':  # required for parallelization on Windows
                                      "Sample By": tani_sample,
                                      "Sample Size": sample_size,
                                      "Sample Weight": weight_representation,
-                                     "Pruned": prune_by_filter
+                                     "Pruned": prune_to_targets
                                      })
 
     if write_local:

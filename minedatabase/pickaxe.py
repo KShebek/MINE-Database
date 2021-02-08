@@ -7,6 +7,7 @@ import copy
 import time
 import csv
 import os
+import pickle
 
 from argparse import ArgumentParser
 from functools import partial
@@ -14,7 +15,10 @@ from sys import exit
 
 import minedatabase.databases as databases
 
-from minedatabase.databases import MINE
+from minedatabase.databases import (
+            MINE, save_compounds_to_db,
+            save_reactions_to_db, save_core_compounds_to_db, save_targets_to_db)
+
 from minedatabase import utils
 
 from rdkit.Chem.rdMolDescriptors import CalcMolFormula
@@ -27,6 +31,7 @@ from rdkit.Chem.AllChem import (
 
 from rdkit import RDLogger
 
+from pymongo import InsertOne
 
 class Pickaxe:
     """This class generates new compounds from user-specified starting
@@ -105,28 +110,29 @@ class Pickaxe:
         if database:
             # Determine if a specified database is legal
             db = MINE(database, self.mongo_uri)
-            if database in db.client.list_database_names():
-                if database_overwrite:
-                    # If db exists, remove db from all of core compounds
-                    # and drop db
-                    print((f"Database {database} already exists. "
-                           "Deleting database and removing from core compound"
-                           " mines."))
-                    db.core_compounds.update_many(
-                            {},
-                            {'$pull': {'MINES': database}}
-                        )
-                    db.client.drop_database(database)
-                    self.mine = database
-                else:
-                    print((f"Warning! Database {database} already exists."
-                           "Specify database_overwrite as true to delete "
-                           "old database and write new."))
-                    exit("Exiting due to database name collision.")
-                    self.mine = None
-            else:
-                self.mine = database
-            del(db)
+            self.mine = database
+            # if database in db.client.list_database_names():
+            #     if database_overwrite:
+            #         # If db exists, remove db from all of core compounds
+            #         # and drop db
+            #         print((f"Database {database} already exists. "
+            #                "Deleting database and removing from core compound"
+            #                " mines."))
+            #         db.core_compounds.update_many(
+            #                 {},
+            #                 {'$pull': {'MINES': database}}
+            #             )
+            #         db.client.drop_database(database)
+            #         self.mine = database
+            #     else:
+            #         print((f"Warning! Database {database} already exists."
+            #                "Specify database_overwrite as true to delete "
+            #                "old database and write new."))
+            #         exit("Exiting due to database name collision.")
+            #         self.mine = None
+            # else:
+            #     self.mine = database
+            # del(db)
         else:
             self.mine = None
 
@@ -846,8 +852,8 @@ class Pickaxe:
                                               ';'.join(rxn['Operators'])])
                               + '\n')
 
-    def save_to_mine(self, num_workers=1, indexing=True, insert_core=True,
-                     insert_targets=True):
+    def save_to_mine(self, num_workers=1, chunk_size=10000, 
+                     indexing=True, write_core=True, insert_targets=True):
         """Save compounds to a MINE database.
 
         :param num_workers: Number of processors to use.
@@ -865,124 +871,56 @@ class Pickaxe:
             if not (done % print_on):
                 print(f"{section} {round(done / total*100)} percent complete")
 
-        def chunks(lst, n):
-            """Yield successive n-sized chunks from lst."""
-            n = max(n, 1)
-            for i in range(0, len(lst), n):
-                yield lst[i:i + n]
-
         print('\n----------------------------------------')
         print(f'Saving results to {self.mine}')
         print('----------------------------------------\n')
         start = time.time()
+
         db = MINE(self.mine, self.mongo_uri)
 
         # Insert Reactions
         print('--------------- Reactions --------------')
         rxn_start = time.time()
-        # Due to memory concerns, reactions are chunked
-        # and processed that way. Each batch is calculated
-        # in parallel.
-        n_rxns = len(self.reactions)
-        chunk_size = max(int(n_rxns/(num_workers*100)), 10000)
-        print(f"Reaction chunk size writing: {chunk_size}")
-        n_loop = 1
-        for rxn_id_chunk in chunks(list(self.reactions.keys()), chunk_size):
-            print(f"Writing Reaction Chunk {n_loop} "
-                  f"of {round(n_rxns/chunk_size)+1}")
-            n_loop += 1
-            mine_rxn_requests = self._save_reactions(rxn_id_chunk,
-                                                     db, num_workers)
-            if mine_rxn_requests:
-                db.reactions.bulk_write(mine_rxn_requests, ordered=False)
-                del(mine_rxn_requests)
-        print("Finished Inserting Reactions in "
-              f" {time.time() - rxn_start} seconds.")
+        save_reactions_to_db(self.reactions, db, chunk_size)
+        print(f"Finished Inserting Reactions in {time.time() - rxn_start} seconds.")
         print('----------------------------------------\n')
 
         print('--------------- Compounds --------------')
         cpd_start = time.time()
-        # Due to memory concerns, compounds are chunked
-        # and processed that way. Each batch is calculated
-        # in parallel.
-        n_cpds = len(self.compounds)
-        chunk_size = max(int(n_cpds/(num_workers*100)), 10000)
-        print(f"Compound chunk size: {chunk_size}")
-        n_loop = 1
-        for cpd_id_chunk in chunks(list(self.compounds.keys()), chunk_size):
-            # Insert the three types of compounds
-            print(f"Writing Compound Chunk {n_loop} "
-                  f"of {round(n_cpds/chunk_size)+1}")
-            n_loop += 1
-            res = self._save_compounds(cpd_id_chunk, db, num_workers)
-            core_cpd_requests = res[0]
-            core_update_mine_requests = res[1]
-            mine_cpd_requests = res[2]
-
-            if core_cpd_requests:
-                if insert_core:
-                    db.core_compounds.bulk_write(core_cpd_requests,
-                                                 ordered=False)
-                del(core_cpd_requests)
-            if core_update_mine_requests:
-                if insert_core:
-                    db.core_compounds.bulk_write(core_update_mine_requests,
-                                                 ordered=False)
-                del(core_update_mine_requests)
-            if mine_cpd_requests:
-                db.compounds.bulk_write(mine_cpd_requests, ordered=False)
-                del(mine_cpd_requests)
-
-        print("Finished inserting Compounds to the MINE in "
-              f"{time.time() - cpd_start} seconds.")
-        if insert_core:
-            db.meta_data.insert_one({"Timestamp": datetime.datetime.now(),
-                                     "Action": "Core Compounds Inserted"})
-        db.meta_data.insert_one({"Timestamp": datetime.datetime.now(),
-                                 "Action": "Mine Compounds Inserted"})
+        save_compounds_to_db(self.compounds, db, chunk_size)
+        if write_core:
+            save_core_compounds_to_db(self.compounds, db, self.mine, 
+                                        chunk_size, num_workers)
+        print(f"Finished inserting Compounds to the MINE in {time.time() - cpd_start} seconds.")
+        # db.meta_data.insert_one({"Timestamp": datetime.datetime.now(),
+                                #  "Action": "Mine Compounds Inserted"})
+        # if write_core:
+        #     db.meta_data.insert_one({"Timestamp": datetime.datetime.now(),
+        #                              "Action": "Core Compounds Inserted"})
         print("----------------------------------------\n")
 
         # Insert target compounds
         if insert_targets and self.targets:
             target_start = time.time()
-            target_cpd_requests = []
-            # Write target compounds to target collection
-            # Target compounds are written as mine compounds
             print("--------------- Targets ----------------")
-            # Insert target compounds
-            target_start = time.time()
-            # non-parallel insertion
-            for comp_dict in self.targets.values():
-                db.insert_mine_compound(comp_dict, target_cpd_requests)
-            print("Done with Target Prep--took "
-                  f"{time.time() - target_start} seconds.")
-            if target_cpd_requests:
-                target_start = time.time()
-                db.target_compounds.bulk_write(target_cpd_requests,
-                                               ordered=False)
-                print(f"Inserted {len(target_cpd_requests)}"
-                      f" Target Compounds in {time.time() - target_start}"
-                      " seconds.")
-                del(target_cpd_requests)
-                db.meta_data.insert_one({"Timestamp": datetime.datetime.now(),
-                                         "Action": "Target Compounds Inserted"}
-                                        )
-            else:
-                print('No Target Compounds Inserted')
+            save_targets_to_db(self.targets)
+            #     db.meta_data.insert_one({"Timestamp": datetime.datetime.now(),
+        #                              "Action": "Targets Inserted"})
+            print(f"Finished inserting Targets to the MINE in {time.time() - target_start} seconds.")
             print("----------------------------------------\n")
 
-        # Save operators
-        operator_start = time.time()
+        # Save operators        
         if self.operators:
+            operator_start = time.time()
             print("-------------- Operators ---------------")
             # update operator rxn count
             for rxn_dict in self.reactions.values():
                 for op in rxn_dict['Operators']:
                     op = op.split("_")[0] # factor in bimolecular rxns
                     self.operators[op][1]['Reactions_predicted'] += 1
-            db.operators.insert_many([op[1] for op in self.operators.values()])
-            db.meta_data.insert_one({"Timestamp": datetime.datetime.now(),
-                                    "Action": "Operators Inserted"})
+            # db.operators.insert_many([op[1] for op in self.operators.values()])
+            # db.meta_data.insert_one({"Timestamp": datetime.datetime.now(),
+            #                         "Action": "Operators Inserted"})
             print("Done with Operators Overall--took "
                   f"{time.time() - operator_start} seconds.")
         print("----------------------------------------\n")
@@ -1031,6 +969,7 @@ class Pickaxe:
                 db.update_core_compound_MINES(cpd_dict,
                                               core_update_mine_requests)
                 db.insert_core_compound(cpd_dict, core_cpd_requests)
+
         return core_cpd_requests, core_update_mine_requests, mine_cpd_requests
 
     def _save_reactions(self, rxn_ids, db, num_workers=1):
@@ -1121,7 +1060,29 @@ class Pickaxe:
             else:
                 print("No partial operators could be generated.")
 
+    def dump_to_pk(self, fname):
+        d_to_pickle = {
+            "compounds": self.compounds,
+            "reactions": self.reactions,
+            "operators": self.operators,
+            "targets":   self.targets
+        }
 
+        with open(fname, "wb") as f:
+            pickle.dump(d_to_pickle, f)
+
+    def load_pk(self, fname):
+        with open(fname, "rb") as f:
+            pickle_d = pickle.load(f)
+            self.compounds = pickle_d["compounds"]
+            self.reactions = pickle_d["reactions"]
+            self.operators = pickle_d["operators"]
+            self.targets = pickle_d["targets"]
+
+            for key in pickle_d:
+                var = getattr(self, key)
+                if var:
+                    print(f"Loaded {len(var)} {key}")
 
 # def _racemization(compound, max_centers=3, carbon_only=True):
 #     """Enumerates all possible stereoisomers for unassigned chiral centers.
